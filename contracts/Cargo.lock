@@ -1116,6 +1116,7 @@ dependencies = [
 name = "implementation_v2"
 version = "0.0.0"
 dependencies = [
+ "implementation_v1",
  "soroban-sdk",
 ]
 
@@ -1447,6 +1448,7 @@ dependencies = [
 name = "proxy"
 version = "0.0.0"
 dependencies = [
+ "implementation_v1",
  "soroban-sdk",
 ]
 
