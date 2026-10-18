@@ -42,6 +42,8 @@ use soroban_sdk::{
     Address, Env, IntoVal, Symbol,
 };
 
+pub mod interest;
+pub mod liquidation;
 pub mod math;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -375,22 +377,7 @@ impl LendingPool {
         let liq_bonus: i128 = env.storage().instance().get(&Key::LiqBonus).unwrap_or(500);
 
         // seize = repay_amount × (debt_price / coll_price) × (1 + liq_bonus / BPS)
-        let bps_plus_bonus = BPS
-            .checked_add(liq_bonus)
-            .unwrap_or_else(|| panic_with_error!(&env, LPError::Overflow));
-        let numerator = repay_amount
-            .checked_mul(debt_price)
-            .unwrap_or_else(|| panic_with_error!(&env, LPError::Overflow))
-            .checked_mul(bps_plus_bonus)
-            .unwrap_or_else(|| panic_with_error!(&env, LPError::Overflow));
-        let denominator = coll_price
-            .checked_mul(BPS)
-            .unwrap_or_else(|| panic_with_error!(&env, LPError::Overflow));
-        if denominator == 0 {
-            panic_with_error!(&env, LPError::DivisionByZero);
-        }
-        let seize = numerator
-            .checked_div(denominator)
+        let seize = liquidation::seize_amount(repay_amount, debt_price, coll_price, liq_bonus)
             .unwrap_or_else(|| panic_with_error!(&env, LPError::Overflow));
 
         let debt_key = Key::Debt(borrower.clone(), debt_token.clone());
@@ -537,18 +524,7 @@ impl LendingPool {
             .unwrap_or(SCALE);
 
         // Δindex = old_idx × rate × elapsed / (BPS × SECS_PER_YEAR)
-        let denom = BPS
-            .checked_mul(SECS_PER_YEAR)
-            .unwrap_or_else(|| panic_with_error!(env, LPError::Overflow));
-        let delta = old_idx
-            .checked_mul(rate)
-            .unwrap_or_else(|| panic_with_error!(env, LPError::Overflow))
-            .checked_mul(elapsed)
-            .unwrap_or_else(|| panic_with_error!(env, LPError::Overflow))
-            .checked_div(denom)
-            .unwrap_or_else(|| panic_with_error!(env, LPError::DivisionByZero));
-        let new_idx = old_idx
-            .checked_add(delta)
+        let new_idx = interest::next_index(old_idx, rate, elapsed)
             .unwrap_or_else(|| panic_with_error!(env, LPError::Overflow));
 
         env.storage()
@@ -579,12 +555,7 @@ impl LendingPool {
             .persistent()
             .get(&Key::UserIdx(user.clone(), token.clone()))
             .unwrap_or(SCALE);
-        if gidx > uidx && uidx > 0 {
-            let new_principal = principal
-                .checked_mul(gidx)
-                .unwrap_or_else(|| panic_with_error!(env, LPError::Overflow))
-                .checked_div(uidx)
-                .unwrap_or_else(|| panic_with_error!(env, LPError::DivisionByZero));
+        if let Some(new_principal) = interest::accrued_principal(principal, gidx, uidx) {
             env.storage()
                 .persistent()
                 .set(&Key::Debt(user.clone(), token.clone()), &new_principal);
@@ -859,6 +830,144 @@ mod tests {
         client.deposit_collateral(&user, &token, &1_000);
     }
 
+    // ── SC-007 acceptance-criteria tests ──────────────────────────────────────
+
+    /// Pool configured with a hard 75 % LTV cap: collateral factor 7_500 BPS
+    /// (per `add_asset` docs: "Max LTV in BPS") and a health-factor boundary
+    /// of 100 % (mcr = 10_000) so the effective cap is exactly 75 %.
+    fn setup_75pct_ltv_pool(env: &Env) -> (LendingPoolClient<'static>, Address) {
+        let id = env.register(LendingPool, ());
+        let client = LendingPoolClient::new(env, &id);
+        let oracle = env.register(MockOracle, ());
+        let admin = Address::generate(env);
+        client.initialize(&admin, &oracle, &10_000, &800);
+        let token = env.register(MockToken, ());
+        client.add_asset(&token, &7_500, &0);
+        (client, token)
+    }
+
+    /// AC1 (part 1): borrowing to exactly 75 % LTV is allowed.
+    #[test]
+    fn borrow_at_exactly_75pct_ltv_is_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token) = setup_75pct_ltv_pool(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_collateral(&user, &token, &10_000);
+        client.borrow(&user, &token, &token, &7_500); // LTV = 7 500 / 10 000 = 75 %
+
+        assert_eq!(client.debt_of(&user, &token), 7_500);
+        assert!(client.health_ok(&user, &token, &token));
+    }
+
+    /// AC1 (part 2): borrowing beyond 75 % LTV is rejected (#6).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #6)")]
+    fn borrow_above_75pct_ltv_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token) = setup_75pct_ltv_pool(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_collateral(&user, &token, &10_000);
+        client.borrow(&user, &token, &token, &7_501); // LTV = 75.01 % > 75 %
+    }
+
+    /// AC2: a third party repays underwater debt and seizes collateral with
+    /// the spec's 8 % liquidation discount bonus (liq_bonus = 800 BPS).
+    #[test]
+    fn liquidate_seizes_collateral_with_8pct_discount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(LendingPool, ());
+        let client = LendingPoolClient::new(&env, &id);
+        let oracle = env.register(MockOracle, ());
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &oracle, &15_000, &800); // 8 % liquidator bonus
+
+        // Real SAC token so the liquidator's seized collateral is observable
+        // on-chain (MockToken transfers are no-ops by design).
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        client.add_asset(&token, &10_000, &0);
+        let token_client = token::Client::new(&env, &token);
+        let sac = token::StellarAssetClient::new(&env, &token);
+
+        let borrower = Address::generate(&env);
+        let liquidator = Address::generate(&env);
+        sac.mint(&borrower, &15_000);
+        sac.mint(&liquidator, &1_000);
+
+        client.deposit_collateral(&borrower, &token, &15_000);
+        client.borrow(&borrower, &token, &token, &10_000);
+
+        // Push the position underwater without touching the collateral, so the
+        // full seized amount (incl. bonus) can be asserted exactly.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&Key::Debt(borrower.clone(), token.clone()), &20_000i128);
+        });
+        assert!(!client.health_ok(&borrower, &token, &token));
+
+        client.liquidate(&liquidator, &borrower, &token, &token, &1_000);
+
+        // Equal prices, 8 % bonus: seize = 1_000 × 1.08 = 1_080 — the
+        // liquidator repaid 1_000 and received 1_080 of collateral.
+        assert_eq!(token_client.balance(&liquidator), 1_080);
+        assert_eq!(client.debt_of(&borrower, &token), 19_000);
+        assert_eq!(client.collateral_of(&borrower, &token), 15_000 - 1_080);
+        // Repaid debt now sits in the pool's token balance:
+        // pool = 15_000 (coll deposit) - 10_000 (borrowed out) + 1_000 (repaid) = 6_000,
+        // minus the 1_080 seized to the liquidator.
+        assert_eq!(token_client.balance(&client.address), 6_000 - 1_080);
+    }
+
+    /// AC3 (boundary): liquidation is rejected when the health factor is
+    /// exactly 1.0 (adj_coll == req_coll).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn liquidate_rejected_when_health_factor_exactly_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(LendingPool, ());
+        let client = LendingPoolClient::new(&env, &id);
+        let oracle = env.register(MockOracle, ());
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &oracle, &15_000, &500);
+        let token = env.register(MockToken, ());
+        client.add_asset(&token, &10_000, &0);
+
+        let borrower = Address::generate(&env);
+        let liquidator = Address::generate(&env);
+
+        // adj_coll = 15_000 × 100 % = 15_000; req_coll = 10_000 × 150 % = 15_000.
+        client.deposit_collateral(&borrower, &token, &15_000);
+        client.borrow(&borrower, &token, &token, &10_000);
+        assert!(client.health_ok(&borrower, &token, &token)); // HF == 1.0
+
+        client.liquidate(&liquidator, &borrower, &token, &token, &100);
+    }
+
+    /// AC3 (healthy position): liquidation must also be rejected when HF > 1.0.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn liquidate_rejected_when_position_is_healthy() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _) = setup(&env);
+        let token = add_token(&env, &client);
+        let borrower = Address::generate(&env);
+        let liquidator = Address::generate(&env);
+
+        client.deposit_collateral(&borrower, &token, &10_000);
+        client.borrow(&borrower, &token, &token, &1_000); // HF ≫ 1.0
+
+        client.liquidate(&liquidator, &borrower, &token, &token, &100);
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -894,3 +1003,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod test;
