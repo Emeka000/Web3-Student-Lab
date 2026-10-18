@@ -6,24 +6,26 @@
 //! - Strict slippage protection (min output / max input enforcement)
 //! - Dead-shares burn (first 1,000 shares) to prevent share inflation exploits
 //! - Virtual balances to mitigate sandwich attacks
+//! - Strict single-transaction reentrancy guards on every state-mutating
+//!   entry point (flash-swap defense)
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, token, Address, Env,
+    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Env,
     Symbol,
 };
 
 /// Basis points denominator (10,000 bps = 100%)
 const BPS: i128 = 10_000;
 
-/// Dead shares permanently burned on pool initialization
-const DEAD_SHARES: i128 = 1_000;
-
 /// Minimum swap fee in basis points (0.1%)
 const MIN_SWAP_FEE_BPS: i128 = 10;
 
 /// Maximum swap fee in basis points (10%)
 const MAX_SWAP_FEE_BPS: i128 = 1_000;
+
+/// Temporary-storage key for the reentrancy guard mutex.
+const RG_KEY: Symbol = symbol_short!("amm_rg");
 
 // ── Errors (SC-HARD-20: range 400+) ──────────────────────────────────────────
 
@@ -43,11 +45,15 @@ pub enum AmmError {
     SlippageExceeded = 403,
     /// `404` — Contract has not been initialised.
     NotInitialized = 404,
+    /// `405` — A reentrant call was detected and blocked.
+    Reentrancy = 405,
 }
 
+pub mod lp_token;
 pub mod storage;
 pub mod twap;
 
+pub use lp_token::DEAD_SHARES;
 pub use storage::DataKey;
 
 #[contract]
@@ -112,6 +118,7 @@ impl AMMContract {
         if amount_a <= 0 || amount_b <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        Self::lock(&env);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -140,23 +147,21 @@ impl AMMContract {
         let shares = if balance_a == 0 || balance_b == 0 {
             // Initial liquidity: mint sqrt(amount_a * amount_b) shares, reserving
             // DEAD_SHARES that are permanently locked (seeded in initialize).
-            let gross = Self::isqrt(amount_a * amount_b);
-            if gross <= DEAD_SHARES {
-                panic_with_error!(&env, AmmError::InvalidAmount);
+            match lp_token::initial_shares(amount_a, amount_b) {
+                Some(s) => s,
+                None => {
+                    Self::unlock(&env);
+                    panic_with_error!(&env, AmmError::InvalidAmount);
+                }
             }
-            gross - DEAD_SHARES
         } else {
             // Subsequent liquidity: mint proportional to either ratio (use minimum).
-            let shares_from_a = (amount_a * total_shares) / balance_a;
-            let shares_from_b = (amount_b * total_shares) / balance_b;
-            if shares_from_a < shares_from_b {
-                shares_from_a
-            } else {
-                shares_from_b
-            }
+            lp_token::deposit_shares(amount_a, amount_b, balance_a, balance_b, total_shares)
+                .unwrap_or(0)
         };
 
         if shares < min_shares {
+            Self::unlock(&env);
             panic_with_error!(&env, AmmError::SlippageExceeded);
         }
 
@@ -185,6 +190,7 @@ impl AMMContract {
             (provider, amount_a, amount_b, shares),
         );
 
+        Self::unlock(&env);
         shares
     }
 
@@ -200,6 +206,7 @@ impl AMMContract {
         if shares <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        Self::lock(&env);
 
         let pool_share: Address = env.storage().instance().get(&DataKey::PoolShare).unwrap();
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
@@ -213,10 +220,17 @@ impl AMMContract {
         let balance_b: i128 = env.storage().instance().get(&DataKey::BalanceB).unwrap();
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap();
 
-        let amount_a = (shares * balance_a) / total_shares;
-        let amount_b = (shares * balance_b) / total_shares;
+        let (amount_a, amount_b) =
+            match lp_token::withdrawal_amounts(shares, balance_a, balance_b, total_shares) {
+                Some(amounts) => amounts,
+                None => {
+                    Self::unlock(&env);
+                    panic_with_error!(&env, AmmError::InvalidAmount);
+                }
+            };
 
         if amount_a < min_amount_a || amount_b < min_amount_b {
+            Self::unlock(&env);
             panic_with_error!(&env, AmmError::SlippageExceeded);
         }
 
@@ -249,6 +263,7 @@ impl AMMContract {
             (provider, amount_a, amount_b, shares),
         );
 
+        Self::unlock(&env);
         (amount_a, amount_b)
     }
 
@@ -258,6 +273,7 @@ impl AMMContract {
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        Self::lock(&env);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -292,6 +308,7 @@ impl AMMContract {
         let amount_out = amount_out_before_fee - fee;
 
         if amount_out < min_amount_out {
+            Self::unlock(&env);
             panic_with_error!(&env, AmmError::SlippageExceeded);
         }
 
@@ -315,6 +332,7 @@ impl AMMContract {
             (user, amount_in, amount_out, fee),
         );
 
+        Self::unlock(&env);
         amount_out
     }
 
@@ -324,6 +342,7 @@ impl AMMContract {
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        Self::lock(&env);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -358,6 +377,7 @@ impl AMMContract {
         let amount_out = amount_out_before_fee - fee;
 
         if amount_out < min_amount_out {
+            Self::unlock(&env);
             panic_with_error!(&env, AmmError::SlippageExceeded);
         }
 
@@ -381,6 +401,7 @@ impl AMMContract {
             (user, amount_in, amount_out, fee),
         );
 
+        Self::unlock(&env);
         amount_out
     }
 
@@ -430,18 +451,21 @@ impl AMMContract {
         Self::twap_consult(env, token_in, amount_in, twap::TWAP_PERIOD_1H)
     }
 
-    /// Integer square root for initial share calculation.
-    fn isqrt(n: i128) -> i128 {
-        if n == 0 {
-            return 0;
+    /// Acquire the reentrancy guard using temporary storage (flash-swap defense).
+    ///
+    /// Temporary storage entries are removed at ledger close, so a stale lock
+    /// cannot survive across transactions, while within a single transaction
+    /// envelope the entry persists and blocks any reentrant entry call.
+    fn lock(env: &Env) {
+        if env.storage().temporary().has(&RG_KEY) {
+            panic_with_error!(env, AmmError::Reentrancy);
         }
-        let mut x = n;
-        let mut y = (x + 1) / 2;
-        while y < x {
-            x = y;
-            y = (x + n / x) / 2;
-        }
-        x
+        env.storage().temporary().set(&RG_KEY, &true);
+    }
+
+    /// Release the reentrancy guard.
+    fn unlock(env: &Env) {
+        env.storage().temporary().remove(&RG_KEY);
     }
 }
 
