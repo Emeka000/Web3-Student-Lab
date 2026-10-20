@@ -612,3 +612,66 @@ model PaymentRecord {
   @@index([subscriptionId])
   @@map("payment_records")
 }
+
+// Immutable IPFS/Filecoin pins for certificates and course media (BE-011)
+model PinnedAsset {
+  id               String    @id @default(cuid())
+  resourceType     String
+  resourceId       String
+  kind             String
+  cid              String
+  contentType      String
+  sizeBytes        Int
+  sha256           String
+  provider         String
+  filecoinProvider String?
+  filecoinCid      String?
+  filecoinStatus   String    @default("pending") // pending | stored | failed | disabled
+  cdnUrl           String
+  gatewayVerified  Boolean   @default(false)
+  verifiedGateway  String?
+  verifiedAt       DateTime?
+  pinLatencyMs     Int
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@unique([resourceType, resourceId, kind])
+  @@index([cid])
+  @@map("pinned_assets")
+}
+
+// Append-only SHA-256 hash chain of audit events (BE-009)
+model AuditChainEntry {
+  sequence  BigInt   @id
+  eventType String
+  actorId   String?
+  entity    String?
+  entityId  String?
+  payload   Json
+  prevHash  String
+  entryHash String   @unique
+  createdAt DateTime
+
+  @@index([createdAt])
+  @@map("audit_chain_entries")
+}
+
+// Merkle roots of audit chain ranges anchored on the Stellar ledger (BE-009)
+model AuditChainAnchor {
+  id           String    @id @default(cuid())
+  fromSequence BigInt
+  toSequence   BigInt
+  entryCount   Int
+  merkleRoot   String
+  headHash     String
+  network      String
+  txHash       String?
+  status       String    @default("pending") // pending | anchored | failed
+  error        String?
+  createdAt    DateTime  @default(now())
+  anchoredAt   DateTime?
+
+  @@index([toSequence])
+  @@index([status])
+  @@map("audit_chain_anchors")
+}

@@ -18,6 +18,7 @@ import generatorRouter from './generator/generator.routes.js';
 import healthRouter from './health.routes.js';
 import i18nRouter from './i18n.routes.js';
 import learningRoutes from './learning/learning.routes.js';
+import mediaRouter from './media.routes.js';
 import oauthRouter from './oauth.routes.js';
 import osctRouter from './osct/osct.routes.js';
 import playgroundValidateRouter from './playground.routes.js';
@@ -77,6 +78,7 @@ router.use('/feedback', validateWorkspaceMembership, feedbackRouter);
 router.use('/learning', validateWorkspaceMembership, learningRoutes);
 router.use('/canvas', validateWorkspaceMembership, canvasRouter);
 
+router.use('/media', mediaRouter);
 router.use('/dashboard', dashboardRoutes);
 router.use('/dashboard/activity-log', activityLogRouter);
 router.use('/auth', authRoutes);
