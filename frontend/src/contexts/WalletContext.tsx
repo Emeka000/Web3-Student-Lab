@@ -14,6 +14,7 @@ import {
   type Web3TransactionStatus,
 } from '@/lib/web3/transactionMachine';
 import { authAPI } from '@/lib/api';
+import { getSessionBroadcastManager } from '@/services/session/broadcastSync';
 
 export type StellarNetwork = 'PUBLIC' | 'TESTNET' | 'FUTURENET';
 
@@ -632,6 +633,40 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sendTransaction]);
 
+  // Synchronize wallet connect and disconnect across browser tabs
+  useEffect(() => {
+    const manager = getSessionBroadcastManager();
+    const unsubDisconnect = manager.on('WALLET_DISCONNECTED', () => {
+      setPublicKey(null);
+      setActiveWallet(null);
+      setWalletNetwork(null);
+      clearSessionKey();
+      localStorage.removeItem('stellar_wallet');
+      sendTransaction({ type: 'DISCONNECT_WALLET' });
+    });
+
+    const unsubConnect = manager.on('WALLET_CONNECTED', (payload: { wallet: string; publicKey: string; network?: StellarNetwork }) => {
+      if (payload?.publicKey && payload.publicKey !== publicKeyRef.current) {
+        setActiveWallet(payload.wallet);
+        setPublicKey(payload.publicKey);
+        saveSessionKey(payload.publicKey);
+        if (payload.network) {
+          setActiveNetwork(payload.network as StellarNetwork);
+        }
+        sendTransaction({
+          type: 'WALLET_CONNECTED',
+          walletName: payload.wallet,
+          publicKey: payload.publicKey,
+        });
+      }
+    });
+
+    return () => {
+      unsubDisconnect();
+      unsubConnect();
+    };
+  }, [sendTransaction]);
+
   const updateWalletNetwork = useCallback(async (provider: WalletProvider) => {
     if (provider.getNetwork) {
       try {
@@ -665,6 +700,13 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           JSON.stringify({ wallet: provider.name, pk, network: activeNetwork })
         );
         sendTransaction({ type: 'WALLET_CONNECTED', walletName: provider.name, publicKey: pk });
+        try {
+          getSessionBroadcastManager().broadcast('WALLET_CONNECTED', {
+            wallet: provider.name,
+            publicKey: pk,
+            network: activeNetwork,
+          });
+        } catch {}
       } catch (e) {
         const msg = e instanceof Error ? e.message : 'Connection failed';
         setError(msg);
@@ -735,6 +777,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     clearSessionKey();
     localStorage.removeItem('stellar_wallet');
     sendTransaction({ type: 'DISCONNECT_WALLET' });
+    try {
+      getSessionBroadcastManager().broadcast('WALLET_DISCONNECTED', { reason: 'user_action' });
+    } catch {}
   }, [activeWallet, sendTransaction]);
 
   const setAppNetwork = useCallback((network: StellarNetwork) => {

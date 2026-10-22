@@ -2,7 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Ledger as _;
-use soroban_sdk::{Address, Env, String as SorobanString};
+use soroban_sdk::{Address, Bytes, BytesN, Env, String as SorobanString, Vec};
 
 use crate::harness::{BenchmarkReport, EndpointMetrics};
 
@@ -56,6 +56,61 @@ fn mk(endpoint: &str, cpu: u64, mem: u64, success: bool, note: &str) -> Endpoint
         success,
         note: note.to_string(),
     }
+}
+
+fn verify_proof_legacy(
+    env: &Env,
+    leaf: &BytesN<32>,
+    proof: &Vec<BytesN<32>>,
+    root: &BytesN<32>,
+) -> bool {
+    let mut current = leaf.clone();
+    for sibling in proof.iter() {
+        let mut combined = Bytes::new(env);
+        if current.to_array() < sibling.to_array() {
+            combined.append(&current.clone().into());
+            combined.append(&sibling.clone().into());
+        } else {
+            combined.append(&sibling.clone().into());
+            combined.append(&current.clone().into());
+        }
+        current = env.crypto().sha256(&combined).into();
+    }
+    current == *root
+}
+
+#[test]
+fn bench_merkle_proof_packed_hashing() {
+    let env = Env::default();
+    let leaf = BytesN::from_array(&env, &[0x01; 32]);
+    let root = BytesN::from_array(&env, &[0x00; 32]);
+    let mut proof = Vec::new(&env);
+    for byte in 2..18 {
+        proof.push_back(BytesN::from_array(&env, &[byte; 32]));
+    }
+
+    let (optimized_cpu, optimized_mem) = measure(&env, || {
+        crate::smart_vault::MerkleDistributor::verify_proof(&env, &leaf, &proof, &root)
+    });
+    let (legacy_cpu, _) = measure(&env, || verify_proof_legacy(&env, &leaf, &proof, &root));
+
+    assert!(optimized_cpu > 0);
+    assert!(
+        optimized_cpu.saturating_mul(100) <= legacy_cpu.saturating_mul(80),
+        "packed sibling hashing should reduce CPU by at least 20%: optimized={optimized_cpu}, legacy={legacy_cpu}"
+    );
+    record(
+        "smart_vault::verify_proof",
+        optimized_cpu,
+        optimized_mem,
+        "16 siblings; compares fixed-buffer hashing against append-based baseline",
+    );
+    record(
+        "smart_vault::verify_proof_legacy",
+        legacy_cpu,
+        0,
+        "16-sibling append-based comparison baseline",
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

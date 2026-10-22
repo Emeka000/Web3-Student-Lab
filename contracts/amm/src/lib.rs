@@ -8,10 +8,7 @@
 //! - Virtual balances to mitigate sandwich attacks
 
 #![no_std]
-use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, token, Address, Env,
-    Symbol,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, panic_with_error, token, Address, Env};
 
 /// Basis points denominator (10,000 bps = 100%)
 const BPS: i128 = 10_000;
@@ -43,8 +40,28 @@ pub enum AmmError {
     SlippageExceeded = 403,
     /// `404` — Contract has not been initialised.
     NotInitialized = 404,
+    /// `405` — Deadline expired for trade execution.
+    DeadlineExceeded = 405,
+    /// `406` — Same-block bidirectional trades from the same origin address are prohibited.
+    SameBlockBidirectionalTrade = 406,
+    /// `407` — The 24-hour token outflow budget has been exceeded.
+    WithdrawalLimitExceeded = 407,
+    /// `408` — Arithmetic overflow.
+    Overflow = 408,
+    /// `409` — AMM operations are paused by the circuit breaker.
+    ContractPaused = 409,
+    /// `410` — Caller is not authorized to manage the circuit breaker.
+    Unauthorized = 410,
+    /// `411` — Reentrant calls are rejected.
+    ReentrancyGuardTriggered = 411,
+    /// `412` — Pool balances violate the reserve invariant.
+    InvariantViolated = 412,
 }
 
+pub mod anti_mev;
+pub mod circuit_breaker;
+pub mod events;
+pub mod invariants;
 pub mod storage;
 pub mod twap;
 
@@ -55,6 +72,20 @@ pub struct AMMContract;
 
 #[contractimpl]
 impl AMMContract {
+    fn lock(env: &Env) {
+        let key = soroban_sdk::symbol_short!("amm_rg");
+        if env.storage().temporary().has(&key) {
+            panic_with_error!(env, AmmError::ReentrancyGuardTriggered);
+        }
+        env.storage().temporary().set(&key, &true);
+    }
+
+    fn unlock(env: &Env) {
+        env.storage()
+            .temporary()
+            .remove(&soroban_sdk::symbol_short!("amm_rg"));
+    }
+
     /// Initializes the AMM with two tokens and mints dead shares to prevent share inflation.
     pub fn initialize(
         env: Env,
@@ -65,14 +96,17 @@ impl AMMContract {
         fee_collector: Address,
         base_fee_bps: i128,
     ) {
+        Self::lock(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, AmmError::AlreadyInitialized);
         }
+        admin.require_auth();
         if base_fee_bps < MIN_SWAP_FEE_BPS || base_fee_bps > MAX_SWAP_FEE_BPS {
             panic_with_error!(&env, AmmError::InvalidFee);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
+        circuit_breaker::set_guardian(&env, &admin);
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
         env.storage()
@@ -94,10 +128,48 @@ impl AMMContract {
             .instance()
             .set(&DataKey::TotalShares, &DEAD_SHARES);
 
-        env.events().publish(
-            (Symbol::new(&env, "amm_initialized"),),
-            (fee_collector, base_fee_bps),
+        events::initialized(
+            &env,
+            &admin,
+            &token_a,
+            &token_b,
+            &pool_share,
+            &fee_collector,
+            base_fee_bps,
         );
+        Self::unlock(&env);
+    }
+
+    /// Set the address authorized to trigger the emergency pause.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Address) {
+        Self::lock(&env);
+        admin.require_auth();
+        if admin != circuit_breaker::admin(&env) {
+            panic_with_error!(&env, AmmError::Unauthorized);
+        }
+        circuit_breaker::set_guardian(&env, &guardian);
+        events::guardian_changed(&env, &admin, &guardian);
+        Self::unlock(&env);
+    }
+
+    /// Pause swaps and liquidity changes immediately. The admin or designated
+    /// guardian can pause; only the admin can unpause.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) {
+        Self::lock(&env);
+        caller.require_auth();
+        let is_admin = caller == circuit_breaker::admin(&env);
+        if !is_admin && !circuit_breaker::is_guardian(&env, &caller) {
+            panic_with_error!(&env, AmmError::Unauthorized);
+        }
+        if !paused && !is_admin {
+            panic_with_error!(&env, AmmError::Unauthorized);
+        }
+        circuit_breaker::set_paused(&env, paused, &caller);
+        Self::unlock(&env);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        circuit_breaker::is_paused(&env)
     }
 
     /// Adds liquidity and mints pool shares. Requires equal value deposit (x * y = k maintained).
@@ -109,6 +181,8 @@ impl AMMContract {
         min_shares: i128,
     ) -> i128 {
         provider.require_auth();
+        Self::lock(&env);
+        circuit_breaker::assert_not_paused(&env);
         if amount_a <= 0 || amount_b <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
@@ -179,10 +253,17 @@ impl AMMContract {
         twap::update_cumulative_prices(&env, balance_a + amount_a, balance_b + amount_b);
 
         pool_share_client.mint(&provider, &shares);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "liquidity_added"),),
-            (provider, amount_a, amount_b, shares),
+        events::liquidity_added(
+            &env,
+            &provider,
+            amount_a,
+            amount_b,
+            shares,
+            balance_a + amount_a,
+            balance_b + amount_b,
         );
 
         shares
@@ -197,6 +278,8 @@ impl AMMContract {
         min_amount_b: i128,
     ) -> (i128, i128) {
         provider.require_auth();
+        Self::lock(&env);
+        circuit_breaker::assert_not_paused(&env);
         if shares <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
@@ -215,6 +298,7 @@ impl AMMContract {
 
         let amount_a = (shares * balance_a) / total_shares;
         let amount_b = (shares * balance_b) / total_shares;
+        circuit_breaker::record_outflow(&env, balance_a, balance_b, amount_a, amount_b);
 
         if amount_a < min_amount_a || amount_b < min_amount_b {
             panic_with_error!(&env, AmmError::SlippageExceeded);
@@ -243,10 +327,17 @@ impl AMMContract {
 
         token_a_client.transfer(&contract_addr, &provider, &amount_a);
         token_b_client.transfer(&contract_addr, &provider, &amount_b);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "liquidity_removed"),),
-            (provider, amount_a, amount_b, shares),
+        events::liquidity_removed(
+            &env,
+            &provider,
+            amount_a,
+            amount_b,
+            shares,
+            balance_a - amount_a,
+            balance_b - amount_b,
         );
 
         (amount_a, amount_b)
@@ -255,9 +346,12 @@ impl AMMContract {
     /// Swaps token A for token B with dynamic fee based on price impact.
     pub fn swap_a_for_b(env: Env, user: Address, amount_in: i128, min_amount_out: i128) -> i128 {
         user.require_auth();
+        Self::lock(&env);
+        circuit_breaker::assert_not_paused(&env);
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        anti_mev::check_and_record_trade(&env, &user, anti_mev::SwapDirection::AtoB);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -290,6 +384,7 @@ impl AMMContract {
 
         let fee = (amount_out_before_fee * capped_fee_bps) / BPS;
         let amount_out = amount_out_before_fee - fee;
+        circuit_breaker::record_outflow(&env, balance_a, balance_b, 0, amount_out_before_fee);
 
         if amount_out < min_amount_out {
             panic_with_error!(&env, AmmError::SlippageExceeded);
@@ -309,21 +404,43 @@ impl AMMContract {
         let contract_addr = env.current_contract_address();
         token_b_client.transfer(&contract_addr, &user, &amount_out);
         token_b_client.transfer(&contract_addr, &fee_collector, &fee);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "swap_a_for_b"),),
-            (user, amount_in, amount_out, fee),
+        events::swap_a_for_b(
+            &env,
+            &user,
+            amount_in,
+            amount_out,
+            fee,
+            new_a,
+            balance_b - amount_out - fee,
         );
 
         amount_out
     }
 
+    /// Swaps token A for token B with user-specified deadline and slippage protection.
+    pub fn swap_a_for_b_with_deadline(
+        env: Env,
+        user: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        deadline: u64,
+    ) -> i128 {
+        anti_mev::check_deadline(&env, deadline);
+        Self::swap_a_for_b(env, user, amount_in, min_amount_out)
+    }
+
     /// Swaps token B for token A with dynamic fee based on price impact.
     pub fn swap_b_for_a(env: Env, user: Address, amount_in: i128, min_amount_out: i128) -> i128 {
         user.require_auth();
+        Self::lock(&env);
+        circuit_breaker::assert_not_paused(&env);
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
         }
+        anti_mev::check_and_record_trade(&env, &user, anti_mev::SwapDirection::BtoA);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -356,6 +473,7 @@ impl AMMContract {
 
         let fee = (amount_out_before_fee * capped_fee_bps) / BPS;
         let amount_out = amount_out_before_fee - fee;
+        circuit_breaker::record_outflow(&env, balance_a, balance_b, amount_out_before_fee, 0);
 
         if amount_out < min_amount_out {
             panic_with_error!(&env, AmmError::SlippageExceeded);
@@ -375,13 +493,32 @@ impl AMMContract {
         let contract_addr = env.current_contract_address();
         token_a_client.transfer(&contract_addr, &user, &amount_out);
         token_a_client.transfer(&contract_addr, &fee_collector, &fee);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
-        env.events().publish(
-            (Symbol::new(&env, "swap_b_for_a"),),
-            (user, amount_in, amount_out, fee),
+        events::swap_b_for_a(
+            &env,
+            &user,
+            amount_in,
+            amount_out,
+            fee,
+            balance_a - amount_out - fee,
+            new_b,
         );
 
         amount_out
+    }
+
+    /// Swaps token B for token A with user-specified deadline and slippage protection.
+    pub fn swap_b_for_a_with_deadline(
+        env: Env,
+        user: Address,
+        amount_in: i128,
+        min_amount_out: i128,
+        deadline: u64,
+    ) -> i128 {
+        anti_mev::check_deadline(&env, deadline);
+        Self::swap_b_for_a(env, user, amount_in, min_amount_out)
     }
 
     /// Returns current pool state for calculations and display.
@@ -406,9 +543,21 @@ impl AMMContract {
 
     /// Returns current cumulative prices and last block timestamp for TWAP oracle consumers.
     pub fn get_twap_cumulative(env: Env) -> (i128, i128, u64) {
-        let price_a: i128 = env.storage().instance().get(&DataKey::PriceACumulative).unwrap_or(0);
-        let price_b: i128 = env.storage().instance().get(&DataKey::PriceBCumulative).unwrap_or(0);
-        let last_time: u64 = env.storage().instance().get(&DataKey::LastBlockTimestamp).unwrap_or(0);
+        let price_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceACumulative)
+            .unwrap_or(0);
+        let price_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceBCumulative)
+            .unwrap_or(0);
+        let last_time: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastBlockTimestamp)
+            .unwrap_or(0);
         (price_a, price_b, last_time)
     }
 

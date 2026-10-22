@@ -17,6 +17,7 @@ pub struct TwapSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    Guardian,
     TokenA,
     TokenB,
     PoolShare,
@@ -33,4 +34,6 @@ pub enum DataKey {
     LastBlockTimestamp,
     SnapshotCount,
     Snapshot(u32),
+    // ── Anti-MEV Storage Keys ─────────────────────────────────────────
+    TradeRecord(soroban_sdk::Address),
 }

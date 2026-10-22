@@ -1,17 +1,30 @@
 #![no_std]
 
+pub mod events;
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN,
-    Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, String, Vec,
 };
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CertificateStatus {
     Active,
     Revoked,
     Reissued,
     Expired,
+}
+
+/// Result of `verify_certificate`. Exactly one state is returned for any
+/// certificate, with `Revoked` taking precedence over `Expired`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VerificationStatus {
+    Valid,
+    Expired,
+    Revoked,
+    NotFound,
 }
 
 #[contracttype]
@@ -25,14 +38,76 @@ pub struct CertificateRecord {
     pub status: CertificateStatus,
     pub revocation_reason: String,
     pub previous_cert_id: BytesN<32>,
+    /// Hash of the off-chain metadata document, verifiable via
+    /// `verify_content_hash`.
     pub content_hash: BytesN<32>,
+    /// URI pointing at the off-chain metadata document (e.g. `ipfs://...`).
+    pub metadata_uri: String,
+    /// Optional expiration timestamp (ledger seconds). `None` never expires.
+    pub expires_at: Option<u64>,
     /// SEP-0029 secondary-sale royalty cut, in basis points (1/100 of a
     /// percent). 250 == 2.5%. Capped at `MAX_ROYALTY_BPS`.
     pub royalty_bps: u32,
     /// Certificates are soulbound (non-transferable) by default. This flag
-    /// is set once at issuance and can never be cleared — it is an
+    /// is set once at issuance and can never be cleared; it is an
     /// immutable revocation of transferability, not a toggle.
     pub soulbound: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+struct StoredCertificateRecord {
+    owner: Address,
+    issuer: Address,
+    course_id: String,
+    issued_at: u64,
+    metadata: u32,
+    revocation_reason: String,
+    previous_cert_id: BytesN<32>,
+    content_hash: BytesN<32>,
+}
+
+impl StoredCertificateRecord {
+    fn from_record(record: &CertificateRecord) -> Self {
+        let status = match record.status {
+            CertificateStatus::Active => 0,
+            CertificateStatus::Revoked => 1,
+            CertificateStatus::Reissued => 2,
+            CertificateStatus::Expired => 3,
+        };
+        Self {
+            owner: record.owner.clone(),
+            issuer: record.issuer.clone(),
+            course_id: record.course_id.clone(),
+            issued_at: record.issued_at,
+            metadata: record.royalty_bps | (status << 13) | ((record.soulbound as u32) << 15),
+            revocation_reason: record.revocation_reason.clone(),
+            previous_cert_id: record.previous_cert_id.clone(),
+            content_hash: record.content_hash.clone(),
+        }
+    }
+
+    fn into_record(self, cert_id: BytesN<32>) -> CertificateRecord {
+        let status = match (self.metadata >> 13) & 0b11 {
+            0 => CertificateStatus::Active,
+            1 => CertificateStatus::Revoked,
+            2 => CertificateStatus::Reissued,
+            _ => CertificateStatus::Expired,
+        };
+        CertificateRecord {
+            cert_id,
+            owner: self.owner,
+            issuer: self.issuer,
+            course_id: self.course_id,
+            issued_at: self.issued_at,
+            status,
+            revocation_reason: self.revocation_reason,
+            previous_cert_id: self.previous_cert_id,
+            content_hash: self.content_hash,
+            royalty_bps: self.metadata & 0x1fff,
+            soulbound: (self.metadata & (1 << 15)) != 0,
+        }
+    }
 }
 
 /// Maximum royalty a creator may configure: 100.00% expressed in basis
@@ -49,6 +124,16 @@ pub struct RevocationAuditLog {
     pub reason: String,
     pub timestamp: u64,
     pub action: String,
+}
+
+/// Structured event published whenever a certificate is revoked.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CertificateRevokedEvent {
+    pub cert_id: BytesN<32>,
+    pub issuer: Address,
+    pub reason_code: String,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -68,6 +153,22 @@ impl CertificateContract {
     pub fn initialize(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextCertId, &0u64);
+        events::initialized(&env, &admin);
+    }
+
+    /// Registers the institutional ed25519 public key whose signatures
+    /// authorize revocation via `revoke_certificate_with_institution_sig`.
+    /// Admin only.
+    pub fn set_institution_key(env: Env, public_key: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::InstitutionKey, &public_key);
     }
 
     pub fn issue_certificate(
@@ -76,6 +177,8 @@ impl CertificateContract {
         issuer: Address,
         course_id: String,
         content_hash: BytesN<32>,
+        metadata_uri: String,
+        expires_at: Option<u64>,
     ) -> BytesN<32> {
         issuer.require_auth();
 
@@ -98,20 +201,15 @@ impl CertificateContract {
             revocation_reason: String::from_str(&env, ""),
             previous_cert_id: BytesN::from_array(&env, &[0u8; 32]),
             content_hash,
+            metadata_uri,
+            expires_at,
             royalty_bps: 0,
             // Immutable soulbound flag: certificates are non-transferable
             // from the moment they are issued.
             soulbound: true,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id_bytes.clone()), &record);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Certificate(cert_id_bytes.clone()),
-            500_000,
-            500_000,
-        );
+        Self::store_certificate(&env, &record);
 
         env.storage()
             .instance()
@@ -124,47 +222,68 @@ impl CertificateContract {
             String::from_str(&env, "ISSUED"),
             String::from_str(&env, ""),
         );
+        events::issued(
+            &env,
+            &owner,
+            &issuer,
+            &cert_id_bytes,
+            &course_id,
+            &record.content_hash,
+        );
 
         cert_id_bytes
     }
 
+    /// Revokes a certificate. Requires the issuer's authorization.
     pub fn revoke_certificate(env: Env, cert_id: BytesN<32>, reason_code: String) {
-        let mut record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut record = Self::load_certificate(&env, &cert_id);
         if record.status == CertificateStatus::Revoked {
             panic_with_error!(&env, Error::AlreadyRevoked);
         }
         // Enforce native Soroban authentication: only issuer may revoke
         record.issuer.require_auth();
 
-        record.status = CertificateStatus::Revoked;
-        record.revocation_reason = reason_code.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id.clone()), &record);
+        Self::apply_revocation(&env, &mut record, reason_code);
+    }
 
-        Self::log_audit(
-            &env,
-            &cert_id,
-            &record.issuer,
-            String::from_str(&env, "REVOKED"),
-            reason_code,
-        );
+    /// Revokes a certificate authorized by an institutional ed25519
+    /// signature instead of issuer auth. The signature must be over the
+    /// message `cert_id (32 bytes) || reason_code (UTF-8 bytes)` made with
+    /// the key registered via `set_institution_key`. Traps if the
+    /// signature is invalid or no institution key is registered.
+    pub fn revoke_certificate_with_institution_sig(
+        env: Env,
+        cert_id: BytesN<32>,
+        reason_code: String,
+        signature: BytesN<64>,
+    ) {
+        let institution_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstitutionKey)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized));
+
+        let mut record = Self::load_certificate(&env, &cert_id);
+        if record.status == CertificateStatus::Revoked {
+            panic_with_error!(&env, Error::AlreadyRevoked);
+        }
+
+        let message = Self::revocation_message(&env, &cert_id, &reason_code);
+        // Traps on verification failure.
+        env.crypto()
+            .ed25519_verify(&institution_key, &message, &signature);
+
+        Self::apply_revocation(&env, &mut record, reason_code);
+    }
     }
 
     pub fn reissue_certificate(
         env: Env,
         old_cert_id: BytesN<32>,
         new_content_hash: BytesN<32>,
+        new_metadata_uri: String,
     ) -> BytesN<32> {
-        let mut old_record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(old_cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut old_record = Self::load_certificate(&env, &old_cert_id);
         if old_record.status != CertificateStatus::Revoked {
             panic_with_error!(&env, Error::NotRevoked);
         }
@@ -190,27 +309,19 @@ impl CertificateContract {
             revocation_reason: String::from_str(&env, ""),
             previous_cert_id: old_cert_id.clone(),
             content_hash: new_content_hash,
+            metadata_uri: new_metadata_uri,
+            expires_at: old_record.expires_at,
             royalty_bps: old_record.royalty_bps,
             soulbound: true,
         };
 
-        env.storage().persistent().set(
-            &DataKey::Certificate(new_cert_id_bytes.clone()),
-            &new_record,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::Certificate(new_cert_id_bytes.clone()),
-            500_000,
-            500_000,
-        );
+        Self::store_certificate(&env, &new_record);
         env.storage()
             .instance()
             .set(&DataKey::NextCertId, &(new_cert_id + 1));
 
         old_record.status = CertificateStatus::Reissued;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(old_cert_id), &old_record);
+        Self::store_certificate(&env, &old_record);
 
         Self::log_audit(
             &env,
@@ -218,6 +329,13 @@ impl CertificateContract {
             &old_record.issuer,
             String::from_str(&env, "REISSUED"),
             String::from_str(&env, ""),
+        );
+        events::reissued(
+            &env,
+            &new_record.owner,
+            &new_record.issuer,
+            &old_cert_id,
+            &new_cert_id_bytes,
         );
 
         new_cert_id_bytes
@@ -243,6 +361,7 @@ impl CertificateContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::MerkleRoot(cohort_id), 500_000, 500_000);
+        events::cohort_anchored(&env, &root.cohort_id, &root.issuer, &root.root_hash);
     }
 
     pub fn verify_merkle_inclusion(
@@ -258,24 +377,69 @@ impl CertificateContract {
             .unwrap_or_else(|| panic_with_error!(&env, Error::CohortNotFound));
         let mut current = leaf_hash;
         for sibling in proof.iter() {
-            let mut combined = Bytes::new(&env);
-            if current.to_array() < sibling.to_array() {
-                combined.append(&current.clone().into());
-                combined.append(&sibling.clone().into());
-            } else {
-                combined.append(&sibling.clone().into());
-                combined.append(&current.clone().into());
-            }
-            current = env.crypto().sha256(&combined).into();
+            current = Self::hash_pair(&env, &current, &sibling);
         }
         current == root_entry.root_hash
     }
 
+    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let left = left.to_array();
+        let right = right.to_array();
+        let mut pair = [0u8; 64];
+        if left < right {
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+        } else {
+            pair[..32].copy_from_slice(&right);
+            pair[32..].copy_from_slice(&left);
+        }
+        env.crypto().sha256(&Bytes::from_array(env, &pair)).into()
+    }
+
     pub fn get_certificate(env: Env, cert_id: BytesN<32>) -> CertificateRecord {
-        env.storage()
+        Self::load_certificate(&env, &cert_id)
+    }
+
+    /// Single-call verification status. Never panics for unknown IDs.
+    /// Precedence: `NotFound` > `Revoked` > `Expired` > `Valid`.
+    /// Certificates in `Reissued` status are treated as `Revoked` because
+    /// reissuance is only possible after revocation.
+    pub fn verify_certificate(env: Env, cert_id: BytesN<32>) -> VerificationStatus {
+        let record: CertificateRecord = match env
+            .storage()
             .persistent()
             .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound))
+        {
+            Some(r) => r,
+            None => return VerificationStatus::NotFound,
+        };
+
+        match record.status {
+            CertificateStatus::Revoked | CertificateStatus::Reissued => {
+                return VerificationStatus::Revoked;
+            }
+            CertificateStatus::Expired => return VerificationStatus::Expired,
+            CertificateStatus::Active => {}
+        }
+
+        if let Some(expires_at) = record.expires_at {
+            if env.ledger().timestamp() >= expires_at {
+                return VerificationStatus::Expired;
+            }
+        }
+
+        VerificationStatus::Valid
+    }
+
+    /// Returns `true` if `content_hash` matches the hash recorded for the
+    /// certificate's metadata document. Traps if the certificate is unknown.
+    pub fn verify_content_hash(env: Env, cert_id: BytesN<32>, content_hash: BytesN<32>) -> bool {
+        let record: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certificate(cert_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        record.content_hash == content_hash
     }
 
     pub fn get_merkle_root(env: Env, cohort_id: String) -> MerkleCohortRoot {
@@ -289,11 +453,7 @@ impl CertificateContract {
     /// certificate, in basis points. Only the original issuer may call
     /// this, and only while the certificate is `Active`.
     pub fn set_royalty_bps(env: Env, cert_id: BytesN<32>, royalty_bps: u32) {
-        let mut record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut record = Self::load_certificate(&env, &cert_id);
 
         record.issuer.require_auth();
 
@@ -302,20 +462,15 @@ impl CertificateContract {
         }
 
         record.royalty_bps = royalty_bps;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id), &record);
+        Self::store_certificate(&env, &record);
+        events::royalty_updated(&env, &record.owner, &cert_id, &record.issuer, royalty_bps);
     }
 
     /// Compute the SEP-0029 royalty split for a secondary sale of
     /// `sale_amount`. Returns `(creator_cut, seller_proceeds)`; the two
     /// always sum to `sale_amount`.
     pub fn calculate_royalty(env: Env, cert_id: BytesN<32>, sale_amount: i128) -> (i128, i128) {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let record = Self::load_certificate(&env, &cert_id);
 
         if sale_amount <= 0 {
             return (0, 0);
@@ -331,28 +486,31 @@ impl CertificateContract {
     /// standard way to probe (and fail loudly on) transferability instead
     /// of relying on the absence of a `transfer` function.
     pub fn transfer_certificate(env: Env, cert_id: BytesN<32>, _to: Address) {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let _record = Self::load_certificate(&env, &cert_id);
 
-        if record.soulbound {
-            panic_with_error!(&env, Error::SoulboundNonTransferable);
-        }
-        // Non-soulbound certificates are not supported by this contract
-        // today; reaching here would require a future opt-out mechanism.
-        panic_with_error!(&env, Error::SoulboundNonTransferable);
+        panic_with_error!(&env, Error::NonTransferable);
+    }
+
+    /// Always panics with `NonTransferable`. Certificates cannot be moved.
+    pub fn transfer(env: Env, _from: Address, _to: Address, _cert_id: BytesN<32>) {
+        panic_with_error!(&env, Error::NonTransferable);
+    }
+
+    /// Always panics with `NonTransferable`. Certificates cannot be moved.
+    pub fn transfer_from(
+        env: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _cert_id: BytesN<32>,
+    ) {
+        panic_with_error!(&env, Error::NonTransferable);
     }
 
     /// Returns `true` if the certificate is soulbound (non-transferable).
     /// Certificates issued by this contract are always soulbound.
     pub fn is_soulbound(env: Env, cert_id: BytesN<32>) -> bool {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let record = Self::load_certificate(&env, &cert_id);
         record.soulbound
     }
 
@@ -385,6 +543,81 @@ impl CertificateContract {
             500_000,
         );
     }
+
+    fn load_certificate(env: &Env, cert_id: &BytesN<32>) -> CertificateRecord {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StoredCertificateRecord>(&DataKey::CompactCertificate(cert_id.clone()))
+        {
+            return record.into_record(cert_id.clone());
+        }
+        env.storage()
+            .persistent()
+            .get::<DataKey, CertificateRecord>(&DataKey::Certificate(cert_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotFound))
+    }
+
+    fn store_certificate(env: &Env, record: &CertificateRecord) {
+        let key = DataKey::CompactCertificate(record.cert_id.clone());
+        env.storage()
+            .persistent()
+            .set(&key, &StoredCertificateRecord::from_record(record));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 500_000, 500_000);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(record.cert_id.clone()));
+    }
+}
+
+impl CertificateContract {
+    /// Marks the record revoked, persists it, appends an audit entry and
+    /// publishes a `CertificateRevokedEvent`. Callers must perform their
+    /// own authorization and status checks first.
+    fn apply_revocation(env: &Env, record: &mut CertificateRecord, reason_code: String) {
+        let cert_id = record.cert_id.clone();
+        let issuer = record.issuer.clone();
+
+        record.status = CertificateStatus::Revoked;
+        record.revocation_reason = reason_code.clone();
+        Self::store_certificate(env, record);
+
+        Self::log_audit(
+            env,
+            &cert_id,
+            &issuer,
+            String::from_str(env, "REVOKED"),
+            reason_code.clone(),
+        );
+
+        events::revoked(
+            env,
+            &record.owner,
+            &record.issuer,
+            &cert_id,
+            &record.revocation_reason,
+        );
+
+        env.events().publish(
+            (symbol_short!("cert_rev"),),
+            CertificateRevokedEvent {
+                cert_id,
+                issuer,
+                reason_code,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Builds the signed message for institutional revocation:
+    /// `cert_id (32 bytes) || reason_code (UTF-8 bytes)`.
+    fn revocation_message(env: &Env, cert_id: &BytesN<32>, reason_code: &String) -> Bytes {
+        let mut message = Bytes::from_slice(env, &cert_id.to_array());
+        message.append(&Bytes::from(reason_code.clone()));
+        message
+    }
 }
 
 #[contracttype]
@@ -392,7 +625,9 @@ impl CertificateContract {
 pub enum DataKey {
     Admin,
     NextCertId,
+    InstitutionKey,
     Certificate(BytesN<32>),
+    CompactCertificate(BytesN<32>),
     MerkleRoot(String),
     AuditLog(BytesN<32>),
 }
