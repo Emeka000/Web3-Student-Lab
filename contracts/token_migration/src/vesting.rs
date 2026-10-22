@@ -3,8 +3,8 @@
 //! Provides linear token vesting for migrated balances, educator incentives,
 //! and team grants with cliff enforcement and revocable schedules.
 
-use soroban_sdk::{contracttype, Address};
 use crate::MigError;
+use soroban_sdk::{contracttype, Address};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +68,9 @@ impl MigrationVestingSchedule {
         let elapsed = (current_ledger - self.start_ledger) as i128;
         let duration = (self.end_ledger - self.start_ledger) as i128;
 
-        (self.total_amount * elapsed) / duration
+        let whole = (self.total_amount / duration) * elapsed;
+        let remainder = (self.total_amount % duration) * elapsed / duration;
+        whole + remainder
     }
 
     /// Claimable amount = vested_amount - claimed_amount

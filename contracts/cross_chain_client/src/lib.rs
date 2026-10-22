@@ -1,11 +1,12 @@
-//! Cross-Chain Proof Verification Client – Issue #1100
+//! Cross-chain proof verifier for signed EVM headers and Ethereum receipts.
 //!
-//! A lightweight Soroban bridge client that validates inbound bridge proofs and
-//! keeps replay protection for relayed state transitions from Ethereum and Polygon.
-//! The contract keeps the original message-ingest flow while adding the required
-//! proof-verification and asset-unlock logic expected by the bridge design.
+//! Receipt-based unlock records are accepted only after RLP header validation,
+//! validator consensus, finality checks, and Merkle Patricia Trie inclusion.
 
 #![no_std]
+
+pub mod mpt;
+pub mod rlp;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
@@ -37,7 +38,16 @@ pub struct BridgeHeader {
     pub parent_hash: BytesN<32>,
     pub state_root: BytesN<32>,
     pub tx_root: BytesN<32>,
+    pub receipts_root: BytesN<32>,
+    pub rlp_verified: bool,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceBridge {
+    pub address: Bytes,
+    pub lock_topic: BytesN<32>,
 }
 
 /// Proof metadata associated with a wrapped asset unlock request.
@@ -74,6 +84,11 @@ pub enum ClientKey {
     Unlock(BytesN<32>),
     /// Consensus threshold for validator signatures.
     Threshold,
+    ConfirmationDepth,
+    LatestHeader(ChainId),
+    LastReceiptIndex(ChainId, u64),
+    HasReceiptIndex(ChainId, u64),
+    SourceBridge(ChainId),
 }
 
 #[contracterror]
@@ -92,6 +107,12 @@ pub enum ClientError {
     InvalidProof = 11,
     ReplayDetected = 12,
     EmptyProof = 13,
+    InvalidRlp = 14,
+    HeaderNotConfirmed = 15,
+    NonMonotonicReceiptIndex = 16,
+    InvalidReceipt = 17,
+    SourceBridgeNotConfigured = 18,
+    InvalidLockEvent = 19,
 }
 
 #[contract]
@@ -107,6 +128,42 @@ impl CrossChainClient {
         }
         env.storage().instance().set(&ClientKey::Admin, &admin);
         env.storage().instance().set(&ClientKey::Threshold, &1u32);
+        env.storage()
+            .instance()
+            .set(&ClientKey::ConfirmationDepth, &12u32);
+    }
+
+    /// Configure the minimum number of later source-chain blocks required for finality.
+    pub fn set_confirmation_depth(env: Env, caller: Address, depth: u32) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        if depth == 0 {
+            panic_with_error!(&env, ClientError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&ClientKey::ConfirmationDepth, &depth);
+    }
+
+    pub fn set_source_bridge(
+        env: Env,
+        caller: Address,
+        chain_id: ChainId,
+        address: Bytes,
+        lock_topic: BytesN<32>,
+    ) {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        if address.len() != 20 {
+            panic_with_error!(&env, ClientError::InvalidProof);
+        }
+        env.storage().persistent().set(
+            &ClientKey::SourceBridge(chain_id),
+            &SourceBridge {
+                address,
+                lock_topic,
+            },
+        );
     }
 
     /// Register a validator pubkey accepted for block-root consensus.
@@ -177,6 +234,16 @@ impl CrossChainClient {
             if !Self::is_validator(env.clone(), signer.clone()) {
                 continue;
             }
+            let mut already_counted = false;
+            for previous in 0..i {
+                if signers.get(previous).unwrap() == signer {
+                    already_counted = true;
+                    break;
+                }
+            }
+            if already_counted {
+                continue;
+            }
             let signature = signatures.get(i).unwrap();
             if Self::verify_signature(env.clone(), &signer, &block_hash, &signature) {
                 valid_sigs += 1;
@@ -214,14 +281,13 @@ impl CrossChainClient {
             parent_hash,
             state_root,
             tx_root: tx_root.clone(),
+            receipts_root: tx_root.clone(),
+            rlp_verified: false,
             timestamp,
         };
         env.storage()
             .persistent()
             .set(&ClientKey::Header(chain_id, block_number), &header);
-        env.storage()
-            .persistent()
-            .set(&ClientKey::ProcessedTx(tx_root.clone()), &true);
 
         block_hash
     }
@@ -259,6 +325,176 @@ impl CrossChainClient {
             .persistent()
             .get(&ClientKey::Header(chain_id, block_number))
             .unwrap_or_else(|| panic_with_error!(&env, ClientError::InvalidHeader))
+    }
+
+    /// Verify an RLP-encoded Ethereum header, bind its hash to its roots, and
+    /// require a contiguous parent link from the previously accepted header.
+    pub fn submit_evm_header(
+        env: Env,
+        caller: Address,
+        chain_id: ChainId,
+        header_rlp: Bytes,
+        signers: Vec<BytesN<32>>,
+        signatures: Vec<BytesN<64>>,
+    ) -> BytesN<32> {
+        caller.require_auth();
+        Self::assert_admin(&env, &caller);
+        let (state_root, tx_root, receipts_root, block_number, timestamp) =
+            rlp::evm_header_fields(&header_rlp)
+                .unwrap_or_else(|| panic_with_error!(&env, ClientError::InvalidRlp));
+        if block_number == 0 {
+            panic_with_error!(&env, ClientError::InvalidHeader);
+        }
+        let block_hash: BytesN<32> = env.crypto().keccak256(&header_rlp).into();
+        if !Self::verify_block_header(env.clone(), block_hash.clone(), signers, signatures) {
+            panic_with_error!(&env, ClientError::InvalidHeader);
+        }
+        let header_item =
+            rlp::decode(&header_rlp, 0).unwrap_or_else(|| panic_with_error!(&env, ClientError::InvalidRlp));
+        let parent_hash = rlp::list_item(&header_rlp, header_item, 0)
+            .and_then(|item| rlp::payload(&header_rlp, item))
+            .and_then(|value| BytesN::<32>::try_from(value).ok())
+            .unwrap_or_else(|| panic_with_error!(&env, ClientError::InvalidRlp));
+
+        if let Some(latest_number) = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&ClientKey::LatestHeader(chain_id))
+        {
+            let expected_number = latest_number
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(&env, ClientError::InvalidHeader));
+            if block_number != expected_number {
+                panic_with_error!(&env, ClientError::InvalidHeader);
+            }
+            let previous = Self::get_header(env.clone(), chain_id, latest_number);
+            if parent_hash != previous.block_hash {
+                panic_with_error!(&env, ClientError::InvalidHeader);
+            }
+        }
+
+        let header = BridgeHeader {
+            chain_id,
+            block_number,
+            block_hash: block_hash.clone(),
+            parent_hash,
+            state_root,
+            tx_root,
+            receipts_root,
+            rlp_verified: true,
+            timestamp,
+        };
+        env.storage()
+            .persistent()
+            .set(&ClientKey::Header(chain_id, block_number), &header);
+        env.storage()
+            .instance()
+            .set(&ClientKey::LatestHeader(chain_id), &block_number);
+        env.events().publish(
+            (symbol_short!("evm_hdr"), chain_id),
+            (block_number, block_hash.clone(), receipts_root),
+        );
+        block_hash
+    }
+
+    pub fn get_confirmation_depth(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&ClientKey::ConfirmationDepth)
+            .unwrap_or(12)
+    }
+
+    /// Verify an RLP receipt against a finalized Ethereum receipts trie root.
+    /// For each source chain, receipt transaction indices must increase strictly.
+    pub fn verify_receipt_proof(
+        env: Env,
+        chain_id: ChainId,
+        block_number: u64,
+        transaction_index: u64,
+        receipt: Bytes,
+        proof_nodes: Vec<Bytes>,
+    ) -> bool {
+        Self::verify_receipt_internal(
+            &env,
+            chain_id,
+            block_number,
+            transaction_index,
+            &receipt,
+            &proof_nodes,
+            false,
+        )
+    }
+
+    /// Verify a finalized source-chain lock event before recording an unlock.
+    /// Lock event data is ABI-encoded as asset_id[32] || recipient[32] || amount[32].
+    pub fn unlock_from_receipt(
+        env: Env,
+        chain_id: ChainId,
+        block_number: u64,
+        transaction_index: u64,
+        tx_hash: BytesN<32>,
+        receipt: Bytes,
+        proof_nodes: Vec<Bytes>,
+        asset_id: BytesN<32>,
+        recipient: BytesN<32>,
+        amount: i128,
+    ) -> bool {
+        if env
+            .storage()
+            .persistent()
+            .get::<ClientKey, bool>(&ClientKey::ProcessedTx(tx_hash.clone()))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ClientError::ReplayDetected);
+        }
+        let source_bridge: SourceBridge = env
+            .storage()
+            .persistent()
+            .get(&ClientKey::SourceBridge(chain_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ClientError::SourceBridgeNotConfigured));
+        if !rlp::receipt_has_lock(
+            &env,
+            &receipt,
+            &source_bridge.address,
+            &source_bridge.lock_topic,
+            &asset_id,
+            &recipient,
+            amount,
+        ) {
+            panic_with_error!(&env, ClientError::InvalidLockEvent);
+        }
+        Self::verify_receipt_internal(
+            &env,
+            chain_id,
+            block_number,
+            transaction_index,
+            &receipt,
+            &proof_nodes,
+            true,
+        );
+        let header = Self::get_header(env.clone(), chain_id, block_number);
+        let recipient_bytes: Bytes = recipient.into();
+        let record = UnlockRecord {
+            chain_id,
+            tx_hash: tx_hash.clone(),
+            asset_id,
+            recipient: recipient_bytes.clone(),
+            amount,
+            block_number,
+            proof_root: header.receipts_root,
+            unlocked_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&ClientKey::Unlock(tx_hash.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&ClientKey::ProcessedTx(tx_hash.clone()), &true);
+        env.events().publish(
+            (symbol_short!("asset_unlk"), chain_id),
+            (tx_hash, block_number, transaction_index, asset_id, recipient_bytes, amount),
+        );
+        true
     }
 
     /// Lightweight proof verification for a Merkle inclusion path.
@@ -314,87 +550,38 @@ impl CrossChainClient {
         Self::verify_merkle_proof(env, leaf_hash, proof, path, expected_root)
     }
 
-    /// Unlock wrapped assets once a valid proof and validator consensus have been accepted.
+    /// Legacy hash-chain unlock is disabled. Use `unlock_from_receipt`.
     pub fn unlock_asset(
         env: Env,
-        caller: Address,
-        chain_id: ChainId,
-        tx_hash: BytesN<32>,
-        leaf_hash: BytesN<32>,
-        proof: Vec<BytesN<32>>,
-        path: Bytes,
-        expected_root: BytesN<32>,
-        asset_id: BytesN<32>,
-        recipient: Bytes,
-        amount: i128,
+        _caller: Address,
+        _chain_id: ChainId,
+        _tx_hash: BytesN<32>,
+        _leaf_hash: BytesN<32>,
+        _proof: Vec<BytesN<32>>,
+        _path: Bytes,
+        _expected_root: BytesN<32>,
+        _asset_id: BytesN<32>,
+        _recipient: Bytes,
+        _amount: i128,
     ) -> bool {
-        caller.require_auth();
-        Self::assert_admin(&env, &caller);
-
-        if env
-            .storage()
-            .persistent()
-            .get::<ClientKey, bool>(&ClientKey::ProcessedTx(tx_hash.clone()))
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, ClientError::ReplayDetected);
-        }
-
-        if !Self::verify_merkle_proof(env.clone(), leaf_hash, proof, path, expected_root.clone()) {
-            panic_with_error!(&env, ClientError::InvalidProof);
-        }
-
-        let record = UnlockRecord {
-            chain_id,
-            tx_hash: tx_hash.clone(),
-            asset_id,
-            recipient: recipient.clone(),
-            amount,
-            block_number: 0,
-            proof_root: expected_root,
-            unlocked_at: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&ClientKey::Unlock(tx_hash.clone()), &record);
-        env.storage()
-            .persistent()
-            .set(&ClientKey::ProcessedTx(tx_hash.clone()), &true);
-
-        env.events().publish(
-            (symbol_short!("unlock"), chain_id),
-            (tx_hash.clone(), recipient, amount),
-        );
-        true
+        panic_with_error!(&env, ClientError::InvalidProof);
     }
 
+    /// Legacy hash-chain unlock is disabled. Use `unlock_from_receipt`.
     pub fn unlock_wrapped_asset(
         env: Env,
-        caller: Address,
-        chain_id: ChainId,
-        tx_hash: BytesN<32>,
-        leaf_hash: BytesN<32>,
-        proof: Vec<BytesN<32>>,
-        path: Bytes,
-        expected_root: BytesN<32>,
-        asset_id: BytesN<32>,
-        recipient: Bytes,
-        amount: i128,
+        _caller: Address,
+        _chain_id: ChainId,
+        _tx_hash: BytesN<32>,
+        _leaf_hash: BytesN<32>,
+        _proof: Vec<BytesN<32>>,
+        _path: Bytes,
+        _expected_root: BytesN<32>,
+        _asset_id: BytesN<32>,
+        _recipient: Bytes,
+        _amount: i128,
     ) -> bool {
-        Self::unlock_asset(
-            env,
-            caller,
-            chain_id,
-            tx_hash,
-            leaf_hash,
-            proof,
-            path,
-            expected_root,
-            asset_id,
-            recipient,
-            amount,
-        )
+        panic_with_error!(&env, ClientError::InvalidProof);
     }
 
     pub fn get_unlock(env: Env, tx_hash: BytesN<32>) -> UnlockRecord {
@@ -409,6 +596,20 @@ impl CrossChainClient {
             .persistent()
             .get::<ClientKey, bool>(&ClientKey::ProcessedTx(tx_hash))
             .unwrap_or(false)
+    }
+
+    pub fn get_last_receipt_index(env: Env, chain_id: ChainId, block_number: u64) -> Option<u64> {
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&ClientKey::HasReceiptIndex(chain_id, block_number))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        env.storage()
+            .persistent()
+            .get(&ClientKey::LastReceiptIndex(chain_id, block_number))
     }
 
     // -----------------------------------------------------------------------
@@ -542,6 +743,75 @@ impl CrossChainClient {
     ) -> bool {
         let payload: Bytes = message_hash.clone().into();
         env.crypto().ed25519_verify(validator, &payload, signature);
+        true
+    }
+
+    fn verify_receipt_internal(
+        env: &Env,
+        chain_id: ChainId,
+        block_number: u64,
+        transaction_index: u64,
+        receipt: &Bytes,
+        proof_nodes: &Vec<Bytes>,
+        consume: bool,
+    ) -> bool {
+        let header = Self::get_header(env.clone(), chain_id, block_number);
+        if !header.rlp_verified {
+            panic_with_error!(env, ClientError::InvalidHeader);
+        }
+        let latest_number: u64 = env
+            .storage()
+            .instance()
+            .get(&ClientKey::LatestHeader(chain_id))
+            .unwrap_or(0);
+        let depth = Self::get_confirmation_depth(env.clone()) as u64;
+        let confirmed_at = block_number
+            .checked_add(depth)
+            .unwrap_or_else(|| panic_with_error!(env, ClientError::InvalidHeader));
+        if latest_number < confirmed_at {
+            panic_with_error!(env, ClientError::HeaderNotConfirmed);
+        }
+        if consume
+            && env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&ClientKey::HasReceiptIndex(chain_id, block_number))
+            .unwrap_or(false)
+        {
+            let last_index: u64 = env
+                .storage()
+                .persistent()
+                .get(&ClientKey::LastReceiptIndex(chain_id, block_number))
+                .unwrap_or(0);
+            if transaction_index <= last_index {
+                panic_with_error!(env, ClientError::NonMonotonicReceiptIndex);
+            }
+        }
+        if !rlp::is_receipt(receipt) {
+            panic_with_error!(env, ClientError::InvalidReceipt);
+        }
+        let trie_key = rlp::encode_index(env, transaction_index);
+        if !mpt::verify_proof(env, &header.receipts_root, &trie_key, receipt, proof_nodes) {
+            panic_with_error!(env, ClientError::InvalidProof);
+        }
+        if consume {
+            env.storage()
+                .persistent()
+                .set(
+                    &ClientKey::LastReceiptIndex(chain_id, block_number),
+                    &transaction_index,
+                );
+            env.storage()
+                .persistent()
+                .set(
+                    &ClientKey::HasReceiptIndex(chain_id, block_number),
+                    &true,
+                );
+            env.events().publish(
+                (symbol_short!("receipt_ok"), chain_id),
+                (block_number, transaction_index, header.receipts_root),
+            );
+        }
         true
     }
 
