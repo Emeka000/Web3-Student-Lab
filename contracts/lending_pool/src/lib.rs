@@ -42,9 +42,11 @@ use soroban_sdk::{
     Address, Env, IntoVal, Symbol,
 };
 
+pub mod flash_loan;
 pub mod interest;
 pub mod liquidation;
 pub mod math;
+pub mod staking_rewards;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -463,6 +465,65 @@ impl LendingPool {
         env.events().publish((symbol_short!("lp_pause"),), paused);
     }
 
+    // ── Flash Loan (SC-031) ───────────────────────────────────────────────────
+
+    /// Executes an uncollateralized flash loan requiring 0.09% fee and full repayment.
+    pub fn flash_loan(
+        env: Env,
+        receiver: Address,
+        token: Address,
+        amount: i128,
+        params: soroban_sdk::Bytes,
+    ) -> i128 {
+        Self::check_not_paused(&env);
+        Self::check_supported(&env, &token);
+        flash_loan::FlashLoan::execute_flash_loan(&env, receiver, token, amount, params)
+    }
+
+    // ── Continuous Staking Rewards (SC-032) ───────────────────────────────────
+
+    /// Initialize continuous yield farming rewards.
+    pub fn init_staking(
+        env: Env,
+        staking_token: Address,
+        reward_token: Address,
+        reward_rate: u128,
+        duration_seconds: u64,
+    ) {
+        Self::only_admin(&env);
+        staking_rewards::StakingRewards::initialize(
+            &env,
+            staking_token,
+            reward_token,
+            reward_rate,
+            duration_seconds,
+        );
+    }
+
+    /// Stake tokens into the yield farming pool.
+    pub fn stake(env: Env, user: Address, amount: u128) {
+        user.require_auth();
+        Self::check_not_paused(&env);
+        staking_rewards::StakingRewards::stake(&env, user, amount);
+    }
+
+    /// Unstake tokens from the yield farming pool.
+    pub fn unstake(env: Env, user: Address, amount: u128) {
+        user.require_auth();
+        staking_rewards::StakingRewards::unstake(&env, user, amount);
+    }
+
+    /// Claim accumulated yield farming rewards.
+    pub fn claim_reward(env: Env, user: Address) -> u128 {
+        user.require_auth();
+        staking_rewards::StakingRewards::claim_reward(&env, user)
+    }
+
+    /// View earned rewards for a user.
+    pub fn earned(env: Env, user: Address) -> u128 {
+        staking_rewards::StakingRewards::earned(&env, &user)
+    }
+
     // ── Views ─────────────────────────────────────────────────────────────────
 
     pub fn collateral_of(env: Env, user: Address, token: Address) -> i128 {
@@ -694,7 +755,7 @@ impl LendingPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env};
 
     /// Minimal mock oracle: always returns SCALE for any token.
     #[contract]
@@ -706,12 +767,20 @@ mod tests {
         }
     }
 
-    /// Minimal mock token: transfer is a no-op (avoids balance accounting).
+    /// Mock token tracking balances.
     #[contract]
     struct MockToken;
     #[contractimpl]
     impl MockToken {
-        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let from_bal: i128 = env.storage().instance().get(&from).unwrap_or(10_000_000_000);
+            let to_bal: i128 = env.storage().instance().get(&to).unwrap_or(10_000_000_000);
+            env.storage().instance().set(&from, &(from_bal - amount));
+            env.storage().instance().set(&to, &(to_bal + amount));
+        }
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().instance().get(&id).unwrap_or(10_000_000_000)
+        }
     }
 
     fn setup(env: &Env) -> (LendingPoolClient<'static>, Address, Address) {
@@ -861,7 +930,7 @@ mod tests {
         assert!(client.health_ok(&user, &token, &token));
     }
 
-    /// AC1 (part 2): borrowing beyond 75 % LTV is rejected (#6).
+    /// AC1 (part 2): borrowing above 75 % LTV is rejected with SlippageExceeded (#6).
     #[test]
     #[should_panic(expected = "Error(Contract, #6)")]
     fn borrow_above_75pct_ltv_is_rejected() {
@@ -871,79 +940,91 @@ mod tests {
         let user = Address::generate(&env);
 
         client.deposit_collateral(&user, &token, &10_000);
-        client.borrow(&user, &token, &token, &7_501); // LTV = 75.01 % > 75 %
+        // 7 501 / 10 000 = 75.01 % > 75 % hard cap -> panic
+        client.borrow(&user, &token, &token, &7_501);
     }
 
-    /// AC2: a third party repays underwater debt and seizes collateral with
-    /// the spec's 8 % liquidation discount bonus (liq_bonus = 800 BPS).
+    /// AC2: liquidation seizes borrower collateral with an exact 8 % discount.
     #[test]
     fn liquidate_seizes_collateral_with_8pct_discount() {
         let env = Env::default();
         env.mock_all_auths();
+
         let id = env.register(LendingPool, ());
         let client = LendingPoolClient::new(&env, &id);
         let oracle = env.register(MockOracle, ());
         let admin = Address::generate(&env);
-        client.initialize(&admin, &oracle, &15_000, &800); // 8 % liquidator bonus
 
-        // Real SAC token so the liquidator's seized collateral is observable
-        // on-chain (MockToken transfers are no-ops by design).
-        let token = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        client.add_asset(&token, &10_000, &0);
-        let token_client = token::Client::new(&env, &token);
-        let sac = token::StellarAssetClient::new(&env, &token);
+        // liq_bonus = 800 BPS = exactly 8 %
+        client.initialize(&admin, &oracle, &13_333, &800);
+
+        let coll_admin = Address::generate(&env);
+        let coll_token_id = env.register_stellar_asset_contract_v2(coll_admin.clone());
+        let coll_token = coll_token_id.address();
+
+        let debt_admin = Address::generate(&env);
+        let debt_token_id = env.register_stellar_asset_contract_v2(debt_admin.clone());
+        let debt_token = debt_token_id.address();
+
+        client.add_asset(&coll_token, &7_500, &0);
+        client.add_asset(&debt_token, &7_500, &0);
 
         let borrower = Address::generate(&env);
         let liquidator = Address::generate(&env);
-        sac.mint(&borrower, &15_000);
-        sac.mint(&liquidator, &1_000);
 
-        client.deposit_collateral(&borrower, &token, &15_000);
-        client.borrow(&borrower, &token, &token, &10_000);
+        token::StellarAssetClient::new(&env, &coll_token).mint(&borrower, &50_000);
+        token::StellarAssetClient::new(&env, &debt_token).mint(&liquidator, &50_000);
 
-        // Push the position underwater without touching the collateral, so the
-        // full seized amount (incl. bonus) can be asserted exactly.
-        env.as_contract(&client.address, || {
-            env.storage()
-                .persistent()
-                .set(&Key::Debt(borrower.clone(), token.clone()), &20_000i128);
-        });
-        assert!(!client.health_ok(&borrower, &token, &token));
+        client.deposit_collateral(&borrower, &coll_token, &20_000);
+        client.borrow(&borrower, &debt_token, &debt_token, &20_000);
 
-        client.liquidate(&liquidator, &borrower, &token, &token, &1_000);
+        assert!(!client.health_ok(&borrower, &coll_token, &debt_token));
 
-        // Equal prices, 8 % bonus: seize = 1_000 × 1.08 = 1_080 — the
-        // liquidator repaid 1_000 and received 1_080 of collateral.
-        assert_eq!(token_client.balance(&liquidator), 1_080);
-        assert_eq!(client.debt_of(&borrower, &token), 19_000);
-        assert_eq!(client.collateral_of(&borrower, &token), 15_000 - 1_080);
-        // Repaid debt now sits in the pool's token balance:
-        // pool = 15_000 (coll deposit) - 10_000 (borrowed out) + 1_000 (repaid) = 6_000,
-        // minus the 1_080 seized to the liquidator.
-        assert_eq!(token_client.balance(&client.address), 6_000 - 1_080);
+        let debt_token_client = token::Client::new(&env, &debt_token);
+        let coll_token_client = token::Client::new(&env, &coll_token);
+
+        let debt_repay = 1_000i128;
+        let expected_seize = (debt_repay * (10_000 + 800)) / 10_000;
+        assert_eq!(expected_seize, 1_080);
+
+        let liquidator_coll_before = coll_token_client.balance(&liquidator);
+        let pool_coll_before = coll_token_client.balance(&id);
+
+        let seized = client.liquidate(
+            &liquidator,
+            &borrower,
+            &coll_token,
+            &debt_token,
+            &debt_repay,
+        );
+
+        assert_eq!(seized, expected_seize);
+        assert_eq!(
+            coll_token_client.balance(&liquidator) - liquidator_coll_before,
+            1_080
+        );
+        assert_eq!(
+            pool_coll_before - coll_token_client.balance(&id),
+            1_080
+        );
+        assert_eq!(client.debt_of(&borrower, &debt_token), 20_000 - debt_repay);
+        assert_eq!(
+            client.collateral_of(&borrower, &coll_token),
+            20_000 - expected_seize
+        );
     }
 
-    /// AC3 (boundary): liquidation is rejected when the health factor is
-    /// exactly 1.0 (adj_coll == req_coll).
+    /// AC3: liquidation must revert with PositionHealthy (#8) when HF >= 1.0.
     #[test]
     #[should_panic(expected = "Error(Contract, #8)")]
     fn liquidate_rejected_when_health_factor_exactly_one() {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(LendingPool, ());
-        let client = LendingPoolClient::new(&env, &id);
-        let oracle = env.register(MockOracle, ());
-        let admin = Address::generate(&env);
-        client.initialize(&admin, &oracle, &15_000, &500);
-        let token = env.register(MockToken, ());
-        client.add_asset(&token, &10_000, &0);
-
+        let (client, admin, _) = setup(&env);
+        let token = add_token(&env, &client);
         let borrower = Address::generate(&env);
         let liquidator = Address::generate(&env);
 
-        // adj_coll = 15_000 × 100 % = 15_000; req_coll = 10_000 × 150 % = 15_000.
         client.deposit_collateral(&borrower, &token, &15_000);
         client.borrow(&borrower, &token, &token, &10_000);
         assert!(client.health_ok(&borrower, &token, &token)); // HF == 1.0
@@ -963,9 +1044,69 @@ mod tests {
         let liquidator = Address::generate(&env);
 
         client.deposit_collateral(&borrower, &token, &10_000);
-        client.borrow(&borrower, &token, &token, &1_000); // HF ≫ 1.0
+        client.borrow(&borrower, &token, &token, &1_000); // HF >> 1.0
 
         client.liquidate(&liquidator, &borrower, &token, &token, &100);
+    }
+
+    #[contract]
+    struct MockReceiver;
+    #[contractimpl]
+    impl MockReceiver {
+        pub fn execute_operation(
+            env: Env,
+            caller: Address,
+            token: Address,
+            amount: i128,
+            fee: i128,
+            _params: soroban_sdk::Bytes,
+        ) {
+            token::Client::new(&env, &token).transfer(&env.current_contract_address(), &caller, &(amount + fee));
+        }
+    }
+
+    #[test]
+    fn flash_loan_executes_and_charges_fee() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _) = setup(&env);
+        let token = add_token(&env, &client);
+        let receiver = env.register(MockReceiver, ());
+
+        let fee = client.flash_loan(&receiver, &token, &10_000, &soroban_sdk::Bytes::new(&env));
+        // 10_000 * 9 / 10_000 = 9
+        assert_eq!(fee, 9);
+    }
+
+    #[test]
+    fn staking_pool_accumulates_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _) = setup(&env);
+        let staking_token = add_token(&env, &client);
+        let reward_token = add_token(&env, &client);
+        let user1 = Address::generate(&env);
+
+        let reward_rate: u128 = 100_000_000_000_000_000; // 0.1 tokens/sec
+        client.init_staking(&staking_token, &reward_token, &reward_rate, &3600);
+
+        client.stake(&user1, &100_000_000_000_000_000_000); // 100 tokens
+        assert_eq!(client.earned(&user1), 0);
+
+        // Advance ledger timestamp by 10 seconds
+        let current_time = env.ledger().timestamp();
+        env.ledger().set_timestamp(current_time + 10);
+
+        let earned = client.earned(&user1);
+        // 10s * 0.1 = 1 token (1e18)
+        assert_eq!(earned, 1_000_000_000_000_000_000);
+
+        let claimed = client.claim_reward(&user1);
+        assert_eq!(claimed, 1_000_000_000_000_000_000);
+        assert_eq!(client.earned(&user1), 0);
+
+        client.unstake(&user1, &100_000_000_000_000_000_000);
+>>>>>>> main
     }
 
     use proptest::prelude::*;

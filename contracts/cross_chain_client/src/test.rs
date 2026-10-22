@@ -35,6 +35,46 @@ fn compute_root(env: &Env, leaf: &BytesN<32>, proof: &Vec<BytesN<32>>) -> BytesN
     current
 }
 
+fn rlp_string(value: &[u8]) -> std::vec::Vec<u8> {
+    if value.len() == 1 && value[0] < 0x80 {
+        return std::vec![value[0]];
+    }
+    let mut encoded = std::vec::Vec::new();
+    if value.len() < 56 {
+        encoded.push(0x80 + value.len() as u8);
+    } else {
+        let length = (value.len() as u32).to_be_bytes();
+        let first_nonzero = length.iter().position(|byte| *byte != 0).unwrap();
+        let length_bytes = &length[first_nonzero..];
+        encoded.push(0xb7 + length_bytes.len() as u8);
+        encoded.extend_from_slice(length_bytes);
+    }
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+fn rlp_list(items: &[u8]) -> std::vec::Vec<u8> {
+    let mut encoded = std::vec::Vec::new();
+    if items.len() < 56 {
+        encoded.push(0xc0 + items.len() as u8);
+    } else {
+        let length = (items.len() as u32).to_be_bytes();
+        let first_nonzero = length.iter().position(|byte| *byte != 0).unwrap();
+        let length_bytes = &length[first_nonzero..];
+        encoded.push(0xf7 + length_bytes.len() as u8);
+        encoded.extend_from_slice(length_bytes);
+    }
+    encoded.extend_from_slice(items);
+    encoded
+}
+
+fn valid_empty_receipt() -> std::vec::Vec<u8> {
+    let mut contents = std::vec![0x01, 0x01];
+    contents.extend_from_slice(&rlp_string(&[0u8; 256]));
+    contents.push(0xc0);
+    rlp_list(&contents)
+}
+
 #[test]
 fn validator_registration_and_threshold() {
     let env = Env::default();
@@ -141,4 +181,50 @@ fn ledger_timestamp_advances_for_header_accept_time() {
     let (_client, _admin) = setup(&env);
     env.ledger().with_mut(|li| li.timestamp = 1_000);
     assert_eq!(env.ledger().timestamp(), 1_000);
+}
+
+#[test]
+fn rlp_receipt_parser_accepts_valid_receipt_and_rejects_malformed_data() {
+    let receipt = valid_empty_receipt();
+    let receipt = Bytes::from_slice(&Env::default(), &receipt);
+    assert!(rlp::is_receipt(&receipt));
+    assert!(!rlp::is_receipt(&Bytes::from_array(&Env::default(), &[0xf8, 0x01, 0xc0])));
+
+    let env = Env::default();
+    assert_eq!(rlp::encode_index(&env, 0), Bytes::from_array(&env, &[0x80]));
+    assert_eq!(rlp::encode_index(&env, 1), Bytes::from_array(&env, &[0x01]));
+    assert_eq!(rlp::encode_index(&env, 128), Bytes::from_array(&env, &[0x81, 0x80]));
+}
+
+#[test]
+fn mpt_receipt_proof_validates_leaf_against_keccak_root() {
+    let env = Env::default();
+    let receipt = valid_empty_receipt();
+    let key = rlp::encode_index(&env, 0);
+    let compact_path = [0x20, 0x80];
+    let encoded_path = rlp_string(&compact_path);
+    let encoded_receipt = rlp_string(&receipt);
+    let mut leaf_contents = encoded_path;
+    leaf_contents.extend_from_slice(&encoded_receipt);
+    let leaf_node = rlp_list(&leaf_contents);
+    let leaf_node_bytes = Bytes::from_slice(&env, &leaf_node);
+    let root: BytesN<32> = env.crypto().keccak256(&leaf_node_bytes).into();
+    let proof = Vec::from_array(&env, [leaf_node_bytes]);
+
+    assert!(mpt::verify_proof(
+        &env,
+        &root,
+        &key,
+        &Bytes::from_slice(&env, &receipt),
+        &proof
+    ));
+
+    let wrong_value = Bytes::from_array(&env, &[0xc0]);
+    assert!(!mpt::verify_proof(
+        &env,
+        &root,
+        &key,
+        &wrong_value,
+        &proof
+    ));
 }
