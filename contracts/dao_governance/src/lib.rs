@@ -17,8 +17,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, String,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, Env, String,
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -48,12 +47,62 @@ pub struct Proposal {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredProposal {
+    creator: Address,
+    title: String,
+    description: String,
+    deadline: u64,
+    status: u32,
+    tally: i128,
+    credits_spent: u128,
+}
+
+impl StoredProposal {
+    fn from_proposal(proposal: &Proposal) -> Self {
+        Self {
+            creator: proposal.creator.clone(),
+            title: proposal.title.clone(),
+            description: proposal.description.clone(),
+            deadline: proposal.deadline,
+            status: match proposal.status {
+                ProposalStatus::Active => 0,
+                ProposalStatus::Passed => 1,
+                ProposalStatus::Failed => 2,
+                ProposalStatus::Executed => 3,
+            },
+            tally: proposal.tally,
+            credits_spent: proposal.credits_spent,
+        }
+    }
+
+    fn into_proposal(self, id: u64) -> Proposal {
+        Proposal {
+            id,
+            creator: self.creator,
+            title: self.title,
+            description: self.description,
+            deadline: self.deadline,
+            status: match self.status {
+                0 => ProposalStatus::Active,
+                1 => ProposalStatus::Passed,
+                2 => ProposalStatus::Failed,
+                _ => panic!("invalid compact proposal status"),
+            },
+            tally: self.tally,
+            credits_spent: self.credits_spent,
+        }
+    }
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum Key {
     Admin,
     NextId,
     Credits(Address),
     Proposal(u64),
+    CompactProposal(u64),
     Vote(u64, Address),
     UsedNonce(Address, u64),
 }
@@ -86,7 +135,6 @@ pub enum DaoError {
     InsufficientReserves = 15,
 }
 pub mod errors;
-pub use errors::DaoError;
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -142,9 +190,7 @@ impl DaoGovernance {
             tally: 0,
             credits_spent: 0,
         };
-        env.storage()
-            .persistent()
-            .set(&Key::Proposal(id), &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events()
             .publish((symbol_short!("propose"),), (creator, id));
         id
@@ -188,10 +234,7 @@ impl DaoGovernance {
             panic_with_error!(env, DaoError::ZeroVotes);
         }
 
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&Key::Proposal(proposal_id))
+        let mut proposal = load_proposal(env, proposal_id)
             .unwrap_or_else(|| panic_with_error!(env, DaoError::ProposalNotFound));
 
         if proposal.status != ProposalStatus::Active || env.ledger().timestamp() > proposal.deadline
@@ -217,9 +260,7 @@ impl DaoGovernance {
 
         proposal.tally += votes as i128;
         proposal.credits_spent = proposal.credits_spent.saturating_add(cost);
-        env.storage()
-            .persistent()
-            .set(&Key::Proposal(proposal_id), &proposal);
+        Self::store_proposal(env, &proposal);
         env.storage().persistent().set(&vote_key, &votes);
 
         env.events()
@@ -228,10 +269,7 @@ impl DaoGovernance {
 
     /// Finalize a proposal after its deadline.  Anyone may call this.
     pub fn finalize(env: Env, proposal_id: u64) {
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&Key::Proposal(proposal_id))
+        let mut proposal = load_proposal(&env, proposal_id)
             .unwrap_or_else(|| panic_with_error!(&env, DaoError::ProposalNotFound));
 
         if proposal.status != ProposalStatus::Active {
@@ -246,9 +284,7 @@ impl DaoGovernance {
         } else {
             ProposalStatus::Failed
         };
-        env.storage()
-            .persistent()
-            .set(&Key::Proposal(proposal_id), &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events()
             .publish((symbol_short!("finalize"),), (proposal_id, proposal.tally));
     }
@@ -258,19 +294,14 @@ impl DaoGovernance {
         Self::only_admin(&env);
         caller.require_auth();
 
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&Key::Proposal(proposal_id))
+        let mut proposal = load_proposal(&env, proposal_id)
             .unwrap_or_else(|| panic_with_error!(&env, DaoError::ProposalNotFound));
 
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, DaoError::ProposalClosed);
         }
         proposal.status = ProposalStatus::Executed;
-        env.storage()
-            .persistent()
-            .set(&Key::Proposal(proposal_id), &proposal);
+        Self::store_proposal(&env, &proposal);
         env.events()
             .publish((symbol_short!("execute"),), (caller, proposal_id));
     }
@@ -278,7 +309,7 @@ impl DaoGovernance {
     // ── Views ─────────────────────────────────────────────────────────────────
 
     pub fn get_proposal(env: Env, id: u64) -> Option<Proposal> {
-        env.storage().persistent().get(&Key::Proposal(id))
+        load_proposal(&env, id)
     }
 
     pub fn credits_of(env: Env, member: Address) -> u128 {
@@ -338,6 +369,27 @@ impl DaoGovernance {
             .unwrap_or_else(|| panic_with_error!(env, DaoError::NotInitialized));
         admin.require_auth();
     }
+
+    fn store_proposal(env: &Env, proposal: &Proposal) {
+        env.storage().persistent().set(
+            &Key::CompactProposal(proposal.id),
+            &StoredProposal::from_proposal(proposal),
+        );
+        env.storage()
+            .persistent()
+            .remove(&Key::Proposal(proposal.id));
+    }
+}
+
+pub(crate) fn load_proposal(env: &Env, id: u64) -> Option<Proposal> {
+    if let Some(proposal) = env
+        .storage()
+        .persistent()
+        .get::<Key, StoredProposal>(&Key::CompactProposal(id))
+    {
+        return Some(proposal.into_proposal(id));
+    }
+    env.storage().persistent().get(&Key::Proposal(id))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -489,7 +541,10 @@ mod tests {
         // Proposal passes after deadline
         env.ledger().with_mut(|l| l.timestamp += 200);
         client.finalize(&pid);
-        assert_eq!(client.get_proposal(&pid).unwrap().status, ProposalStatus::Passed);
+        assert_eq!(
+            client.get_proposal(&pid).unwrap().status,
+            ProposalStatus::Passed
+        );
 
         // voter_no ragequits before proposal is executed: burns 400 shares
         // Expected payout: 400 * 50,000 / 1000 = 20,000
@@ -525,6 +580,9 @@ mod tests {
 
         // Should panic with YesVoterCannotRagequit (code 13)
         client.ragequit(&voter_yes, &pid, &100u128);
+    }
+
+    #[test]
     fn test_vote_sep0010_and_replay_rejection() {
         let (env, client, admin) = setup();
         let voter = Address::generate(&env);

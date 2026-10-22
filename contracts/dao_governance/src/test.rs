@@ -1,6 +1,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
+    xdr::ToXdr,
     Env, String,
 };
 
@@ -34,6 +35,32 @@ fn quadratic_cost_deducted_correctly() {
     let p = client.get_proposal(&pid).unwrap();
     assert_eq!(p.tally, 3);
     assert_eq!(p.credits_spent, 9);
+}
+
+#[test]
+fn compact_proposal_storage_reduces_size_and_reads_legacy_records() {
+    let (env, client, admin) = setup();
+    let pid = client.create_proposal(
+        &admin,
+        &String::from_str(&env, "Compact"),
+        &String::from_str(&env, "Storage"),
+        &3600,
+    );
+    let proposal = client.get_proposal(&pid).unwrap();
+    let compact = StoredProposal::from_proposal(&proposal);
+
+    assert!(compact.to_xdr(&env).len() < proposal.to_xdr(&env).len());
+    assert_eq!(compact.clone().into_proposal(pid), proposal);
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .remove(&Key::CompactProposal(pid));
+        env.storage()
+            .persistent()
+            .set(&Key::Proposal(pid), &proposal);
+    });
+    assert_eq!(client.get_proposal(&pid), Some(proposal));
 }
 
 #[test]

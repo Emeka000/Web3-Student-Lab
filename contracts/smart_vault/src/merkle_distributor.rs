@@ -61,15 +61,17 @@ impl MerkleDistributor {
     ) -> bool {
         let mut current = leaf.clone();
         for sibling in proof.iter() {
-            let mut combined = Bytes::new(env);
-            if current.to_array() < sibling.to_array() {
-                combined.append(&current.clone().into());
-                combined.append(&sibling.clone().into());
+            let current_array = current.to_array();
+            let sibling_array = sibling.to_array();
+            let mut pair = [0u8; 64];
+            if current_array < sibling_array {
+                pair[..32].copy_from_slice(&current_array);
+                pair[32..].copy_from_slice(&sibling_array);
             } else {
-                combined.append(&sibling.clone().into());
-                combined.append(&current.clone().into());
+                pair[..32].copy_from_slice(&sibling_array);
+                pair[32..].copy_from_slice(&current_array);
             }
-            current = env.crypto().sha256(&combined).into();
+            current = env.crypto().sha256(&Bytes::from_array(env, &pair)).into();
         }
         current == *root
     }
