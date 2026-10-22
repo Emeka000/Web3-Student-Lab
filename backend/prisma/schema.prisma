@@ -674,4 +674,61 @@ model AuditChainAnchor {
   @@index([toSequence])
   @@index([status])
   @@map("audit_chain_anchors")
+// Off-chain state channel between a student and a mentor (#1589 / BE-017).
+// Only funding and the final (or disputed) state are settled on Soroban.
+model StateChannel {
+  id               String    @id @default(cuid())
+  courseId         String
+  contractId       String
+  studentPublicKey String
+  mentorPublicKey  String
+  rewardStroops    String
+  status           String    @default("pending_funding") // pending_funding, open, disputed, settling, settled
+  latestSequence   Int       @default(0)
+  latestState      Json?
+  latestStudentSig String?
+  latestMentorSig  String?
+  fundingTxHash    String?
+  settlementTxHash String?
+  disputeInitiator String?
+  disputeDeadline  DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  updates StateChannelUpdate[]
+
+  @@index([status, disputeDeadline])
+  @@index([studentPublicKey])
+  @@index([mentorPublicKey])
+  @@map("state_channels")
+}
+
+model StateChannelUpdate {
+  id         String   @id @default(cuid())
+  channelId  String
+  sequence   Int
+  stateHash  String
+  state      Json
+  studentSig String
+  mentorSig  String
+  createdAt  DateTime @default(now())
+
+  channel StateChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, sequence])
+  @@map("state_channel_updates")
+}
+
+// Periodic Yjs document snapshot (#1592 / BE-020). Redis streams hold the
+// updates appended since `lastStreamId`.
+model YjsDocumentSnapshot {
+  id           String   @id @default(cuid())
+  name         String   @unique
+  state        Bytes
+  stateVector  Bytes
+  lastStreamId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("yjs_document_snapshots")
 }

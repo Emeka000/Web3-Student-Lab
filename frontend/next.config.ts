@@ -49,6 +49,25 @@ const nextConfig: NextConfig = {
           chunks: 'all',
           priority: 20,
         },
+        // Issue #1341: Route-level code splitting – defer heavy editor/graphing/libs
+        monaco: {
+          test: /[\\/]node_modules[\\/](monaco-editor|@monaco-editor)[\\/]/,
+          name: 'monaco',
+          chunks: 'all',
+          priority: 25,
+        },
+        chartjs: {
+          test: /[\\/]node_modules[\\/](chart\.js|Chart\.js)[\\/]/,
+          name: 'chartjs',
+          chunks: 'all',
+          priority: 25,
+        },
+        yjs: {
+          test: /[\\/]node_modules[\\/](yjs|[\\/]@yjs)[\\/]/,
+          name: 'yjs',
+          chunks: 'all',
+          priority: 25,
+        },
         common: {
           name: 'common',
           minChunks: 2,

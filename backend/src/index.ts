@@ -2,6 +2,7 @@ import { startTracing } from './instrumentation.js';
 import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
 import { createCorsMiddleware } from './config/cors.config.js';
+import { securityHeadersMiddleware } from './middleware/securityHeaders.js';
 import swaggerDocsRouter from './config/swagger.serve.js';
 import { jsonBodySizeLimit } from './middleware/bodySizeLimit.js';
 import { dbRoutingMiddleware } from './middleware/dbRouting.js';
@@ -31,6 +32,9 @@ app.use(tracingMiddleware());
 
 // Mount Sentry Request Handler middleware
 app.use(getSentryRequestHandler());
+
+// Security headers middleware (applied early before route handling)
+app.use(securityHeadersMiddleware);
 
 app.use(createCorsMiddleware());
 
